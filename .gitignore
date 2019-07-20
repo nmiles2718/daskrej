@@ -1,0 +1,4 @@
+/test_data/*spt.fits
+test_data/
+daskrej_output/*fits
+acsrej_output/*fits
