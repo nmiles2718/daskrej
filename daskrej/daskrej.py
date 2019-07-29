@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 
+import argparse
 import logging
 import os
 import time
+import warnings
 
 from astropy.io import fits
 from astropy.visualization import ImageNormalize, LinearStretch, ZScaleInterval
@@ -14,6 +16,13 @@ import matplotlib.pyplot as plt
 plt.style.use('ggplot')
 
 import sep
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('-crsigmas',
+                    help='Comma separated list of thresholding '
+                         'values, e.g. 5,4,3')
+
 
 
 logging.basicConfig(format='%(levelname)-4s '
@@ -31,7 +40,6 @@ _OUTPUT_DIR = os.path.join(
     *os.path.dirname(os.path.abspath(__file__)).split('/')[:-1],
     'daskrej_output'
 )
-
 
 
 @dask.delayed
@@ -61,7 +69,7 @@ def read_file(fname, extname='sci', extnums=(1, 2)):
 
 
 @dask.delayed
-def compute_sky_sep(data, fname, bw=None, bh=None, fw=None, fh=None):
+def compute_sky_sep(data, fname, bw=None, bh=None, fw=None, fh=None, verbose=False):
     """
 
     Parameters
@@ -94,16 +102,17 @@ def compute_sky_sep(data, fname, bw=None, bh=None, fw=None, fh=None):
         LOG.info(msg)
         bkg = sep.Background(data.byteswap().newbyteorder(),
                              bw=bw, bh=bh, fw=fw, fh=fh)
-    # msg = (
-    #     'fname: {}\n'
-    #     'global background level: {:.3f}\n'
-    #     'global background RMS: {:.3f}\n'
-    #     '{}\n'.format(fname,
-    #                   bkg.globalback,
-    #                   bkg.globalrms,
-    #                   '-' * 79)
-    # )
-    # LOG.info(msg)
+    if verbose:
+        msg = (
+            'fname: {}\n'
+            'global background level: {:.3f}\n'
+            'global background RMS: {:.3f}\n'
+            '{}\n'.format(fname,
+                          bkg.globalback,
+                          bkg.globalrms,
+                          '-' * 79)
+        )
+        LOG.info(msg)
     return bkg
 
 @dask.delayed
@@ -234,12 +243,35 @@ def plot(data, cr_mask, xlim=None, ylim=None, fout=None, save=False):
 
     plt.show()
 
+
 @dask.delayed
-def write_image(exthdr=None, extdata=None, crmask=None, fout=None):
+def update_flt(fname=None, crmask=None, exts=[]):
+    shape = crmask.shape
+    chip2 = (slice(0,2048), slice(0, 4096))
+    chip1 = (slice(2048, 4096), slice(0, 4096))
+    with fits.open(fname, mode='update') as hdu:
+        hdu[3].data += crmask[chip2].compute()
+        hdu[6].data += crmask[chip1].compute()
+        hdu.flush()
+    os.system('cp -v {} {}/'.format(fname, _OUTPUT_DIR))
+    return fname
+
+
+
+
+@dask.delayed
+def write_image(
+        exthdr=None,
+        extdata=None,
+        crmask=None,
+        fout=None,
+        overwrite=True
+):
+    LOG.info('Writing out image to {}'.format(fout))
     hdu_list = fits.HDUList()
     hdu_list.append(fits.ImageHDU(extdata, header=exthdr))
     hdu_list.append(fits.ImageHDU(crmask, header=exthdr))
-    hdu_list.writeto(fout, overwrite=True)
+    hdu_list.writeto(fout, overwrite=overwrite)
     return fout
 
 def compute_initial_guess(lazy_arrays,
@@ -346,7 +378,10 @@ def daskrej(
         shape=None,
         dtype=None,
         num_chunks=8,
-        sigma_thresh=(10,)):
+        sigma_thresh=(10,),
+        combine_func=np.median,
+        save_intermediate=False
+):
     """
 
     Parameters
@@ -403,12 +438,14 @@ def daskrej(
     LOG.info('Finished background determination')
     init_guess = compute_initial_guess(lazy_arrays=lazy_arrays,
                                        num_chunks=num_chunks,
-                                       combine_func=np.median)
+                                       combine_func=combine_func)
     i=0
     while i < len(sigma_thresh):
-        LOG.info('Running iteration {}, sigma={} ...'.format(i+1, sigma_thresh[i]))
+        st_iter = time.time()
+        LOG.info(
+            'Running iteration {}, sigma={} ...'.format(i+1, sigma_thresh[i])
+        )
         if i == 0:
-            st_iter = time.time()
             cleaned_arrays, cr_masks = iterative_clean(
                 lazy_arrays=lazy_arrays,
                 shape=shape,
@@ -419,19 +456,8 @@ def daskrej(
                 init_guess=init_guess,
                 sigma_thresh=sigma_thresh[i]
             )
-            et_iter = time.time()
-            duration = et_iter - st_iter
-            units = 'seconds'
-            if duration > 60:
-                duration /= 60
-                units = 'minutes'
-            msg = (
-                'Finished iteration {}. \n'
-                'Total run time: {:.3f} {}'.format(i + 1, duration, units)
-            )
-            LOG.info(msg)
         else:
-            st_iter = time.time()
+
             cleaned_arrays, cr_masks = iterative_clean(
                 lazy_arrays=cleaned_arrays,
                 shape=shape,
@@ -440,34 +466,51 @@ def daskrej(
                 flist=flist,
                 sigma_thresh=sigma_thresh[i],
                 bkg_list=bkg_list,
-                init_guess=init_guess,
+                init_guess=None,
                 cr_masks=cr_masks
             )
-            et_iter = time.time()
-            duration = et_iter - st_iter
-            units = 'seconds'
-            if duration > 60:
-                duration /= 60
-                units = 'minutes'
-            msg = (
-                'Finished iteration {}. \n'
-                'Total run time: {:.3f} {}'.format(i + 1, duration, units)
-            )
-            LOG.info(msg)
+
+        if save_intermediate:
+            daskcleaned = []
+            for clean, f, mask in zip(cleaned_arrays, flist, cr_masks):
+                fiter = f.replace(
+                    '_flt.fits',
+                    '_daskrej_{}iter_flt.fits'.format(i + 1)
+                ).split('/')[-1]
+
+                fout =  _OUTPUT_DIR + '/' + fiter
+                exthdr = fits.getheader(f, ('sci', 1))
+                daskcleaned.append(write_image(fout=fout,
+                                               exthdr=exthdr,
+                                               crmask=mask,
+                                               extdata=clean,
+                                               overwrite=True)
+                                   )
+            dask.compute(*daskcleaned, scheduler='threads')
+        et_iter = time.time()
+
+        duration = et_iter - st_iter
+        units = 'seconds'
+        if duration > 60:
+            duration /= 60
+            units = 'minutes'
+
+        msg = (
+            'Finished iteration {}. \n'
+            'Total run time: {:.3f} {}'.format(i + 1, duration, units)
+        )
+        LOG.info(msg)
         i += 1
 
-    # imout = []
-    # for cleaned, fname, crmask in zip(cleaned_arrays, flist, cr_masks):
-    #     fout = fname.replace('_flt.fits','_daskrej_{}iter_flt.fits'.format(i))
-    #     exthdr = fits.getheader(fname, ('sci', 1))
-    #     imout.append(write_image(fout=fout,
-    #                               exthdr=exthdr,
-    #                               crmask=crmask,
-    #                               extdata=cleaned)
-    #                   )
-    # flist_out = dask.compute(*imout, scheduler='threads')
-    cleaned_stack = da.stack(cleaned_arrays, axis=0)
 
+    updated_flts = [
+        update_flt(fname=f, crmask=mask) for f, mask in zip(flist, cr_masks)
+    ]
+
+    dask.compute(*updated_flts, scheduler='threads')
+
+
+    cleaned_stack = da.stack(cleaned_arrays, axis=0)
     # Compute the sum of all the good background pixels
     final_image = cleaned_stack.sum(axis=0).compute()
 
@@ -488,8 +531,6 @@ def daskrej(
         'Total run time: {:.3f} {}'.format(len(flist), duration, units)
     )
     LOG.info(msg)
-
-
     return final_image
 
 if __name__ == '__main__':
@@ -500,5 +541,6 @@ if __name__ == '__main__':
             shape=(4096, 4096),
             dtype=np.float64,
             num_chunks=8,
-            sigma_thresh=[8,6]
+            sigma_thresh=[8,6],
+            save_intermediate=True
             )
