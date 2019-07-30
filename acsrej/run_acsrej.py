@@ -1,23 +1,32 @@
 #!/usr/bin/env python
 
 import argparse
-from acstools import acsrej
-from astropy.io import fits
 import glob
-import numpy as np
+import logging
 import os
 import time
+
+from acstools import acsrej
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-dir', type=str,
                     help='/path/to/directory/to/process/')
 
 
+LOG = logging.getLogger()
+
+LOG.setLevel(logging.INFO)
 
 _OUTPUT_DIR = os.path.join(
     '/',
-    *os.path.dirname(os.path.abspath(__file__)).split('/'),
+    *os.path.dirname(os.path.abspath(__file__)).split('/')[:-1],
     'acsrej_output'
+)
+
+_TEST_DATA = os.path.join(
+'/',
+    *os.path.dirname(os.path.abspath(__file__)).split('/')[:-1],
+    'test_data'
 )
 
 
@@ -33,22 +42,29 @@ def run_acsrej(exp_list, fout, crsigmas, initgues, skysub):
                   verbose=True)
 
 
-def copy_updated_flts(flist):
-    print('Copying data products to output directory')
+def copy_files(flist, output_dir):
+    LOG.info('Copying data products to output directory')
     for f in flist:
-        os.system('cp {} {}/{}'.format(f,
-                                          _OUTPUT_DIR,
+        os.system('cp -v {} {}/{}'.format(f,
+                                          output_dir,
                                           os.path.basename(f)))
 
 
+def prep_test_data(test_dir=None, output_dir=None):
+    LOG.info('Copying over test data from {}'.format(test_dir))
+    flist = glob.glob(test_dir+'/*flt.fits')
+    copy_files(flist, output_dir)
+    return output_dir
 
 
 def combine_data(directory):
     st = time.time()
-    print('processing data from {}'.format(directory))
-    flt_list = glob.glob(directory+'/*flt.fits')
-    fout_long = directory+'/acsrej_crj.fits'
-    run_acsrej(flt_list,
+    dirname = prep_test_data(test_dir=_TEST_DATA,
+                            output_dir=_OUTPUT_DIR)
+
+    flt_flist = glob.glob(dirname +'/*flt.fits')
+
+    run_acsrej(flt_flist,
                fout_long,
                crsigmas='8,6',
                initgues='med',
@@ -63,20 +79,20 @@ def combine_data(directory):
         units = 'minutes'
     msg = (
         'Processed {} files. \n'
-        'Total run time: {:.3f} {}'.format(len(flt_list), duration, units)
+        'Total run time: {:.3f} {}'.format(len(flt_flist), duration, units)
     )
-    print(msg)
+    LOG.info(msg)
 
 
-    copy_updated_flts(flt_list)
     output = [
             fout_long,
             fout_long.replace('.fits','.tra'),
             fout_long.replace('_crj.fits','_spt.fits')
         ]
-    print('Removing generated files from {}'.format(directory))
+    LOG.info('Removing generated files from {}'.format(directory))
     for f in output:
         os.system('rm -v {}'.format(f))
+
 
 def main():
     args = parser.parse_args()
